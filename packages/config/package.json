@@ -1,0 +1,6 @@
+{
+  "name": "@clipforge/config",
+  "version": "0.1.0",
+  "private": true,
+  "main": "upload-limits.ts"
+}

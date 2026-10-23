@@ -1,0 +1,276 @@
+// Prisma schema for ClipForge AI
+// Phase 1 scope only: User + Project.
+// Video, Clip, Export, Subscription models are added in the phases
+// where those features are actually built — no speculative tables.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Plan {
+  FREE
+  PRO
+  BUSINESS
+}
+
+model User {
+  id            String   @id @default(uuid())
+  // Matches the Supabase Auth user id — Supabase owns credentials,
+  // this table owns app-specific profile data.
+  supabaseAuthId String  @unique
+  email         String   @unique
+  displayName   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Every new signup starts on Free with a starting credit grant.
+  // Stripe (Phase 8) updates `plan`; usage metering (built alongside
+  // each AI feature) decrements `credits`.
+  plan            Plan   @default(FREE)
+  credits         Int    @default(100)
+  storageUsedBytes BigInt @default(0)
+  stripeCustomerId String? @unique
+  isAdmin         Boolean @default(false)
+
+  projects      Project[]
+  generatedImages GeneratedImage[]
+  generatedVideos GeneratedVideo[]
+
+  @@map("users")
+}
+
+enum VideoStatus {
+  UPLOADING
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+}
+
+model Video {
+  id              String      @id @default(uuid())
+  projectId       String
+  project         Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Path inside the Supabase "videos" bucket, e.g. "{userId}/{videoId}/source.mp4"
+  storagePath     String
+  originalFilename String
+  mimeType        String
+  sizeBytes       BigInt
+  status          VideoStatus @default(UPLOADING)
+  failureReason   String?
+
+  // Populated by ffprobe once the API finishes processing. Nullable
+  // because they don't exist until the PROCESSING step completes.
+  durationSeconds Float?
+  width           Int?
+  height          Int?
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  transcript      Transcript?
+  clips           Clip[]
+  thumbnails      Thumbnail[]
+
+  @@index([projectId])
+  @@map("videos")
+}
+
+enum TranscriptStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model Transcript {
+  id          String           @id @default(uuid())
+  videoId     String           @unique
+  video       Video            @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  status      TranscriptStatus @default(PENDING)
+  language    String?
+  fullText    String?
+
+  // Array of { word, start, end, speaker? } — word-level timestamps
+  // straight from faster-whisper's output. Stored as JSON rather than
+  // a normalized table because it's write-once, read-whole (clip
+  // detection consumes the entire array at once, never a single word).
+  words       Json?
+
+  failureReason String?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@map("transcripts")
+}
+
+model Clip {
+  id                String   @id @default(uuid())
+  videoId           String
+  video             Video    @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  startSeconds      Float
+  endSeconds        Float
+  transcriptExcerpt String
+
+  // Individual sub-scores (0-100) so the UI can show *why* a clip
+  // scored well, not just a final number — matches the spec's request
+  // to score hook/emotion/storytelling/viral/information density
+  // separately.
+  hookScore         Float
+  emotionScore      Float
+  storytellingScore Float
+  viralScore        Float
+  infoDensityScore  Float
+  totalScore        Float
+
+  createdAt         DateTime @default(now())
+
+  shorts            Short[]
+
+  @@index([videoId])
+  @@map("clips")
+}
+
+enum ShortStatus {
+  QUEUED
+  PROCESSING
+  READY
+  FAILED
+}
+
+model Short {
+  id            String     @id @default(uuid())
+  clipId        String
+  clip          Clip       @relation(fields: [clipId], references: [id], onDelete: Cascade)
+
+  status        ShortStatus @default(QUEUED)
+  storagePath   String?
+  failureReason String?
+
+  // Caption styling chosen by the user before rendering — kept as JSON
+  // since it's a UI preference blob (font/color/position/animation),
+  // not something we ever query by field.
+  captionStyle  Json?
+
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  @@index([clipId])
+  @@map("shorts")
+}
+
+enum ThumbnailStyle {
+  BOLD_TEXT
+  MINIMAL
+  CINEMATIC
+  HIGH_CONTRAST
+}
+
+model Thumbnail {
+  id            String          @id @default(uuid())
+  videoId       String
+  video         Video           @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  storagePath   String?
+  status        ShortStatus     @default(QUEUED) // reuses QUEUED/PROCESSING/READY/FAILED
+  failureReason String?
+
+  style         ThumbnailStyle  @default(BOLD_TEXT)
+  overlayText   String?
+  sourceTimestampSeconds Float  @default(0)
+
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@index([videoId])
+  @@map("thumbnails")
+}
+
+enum GenerationStatus {
+  QUEUED
+  PROCESSING
+  READY
+  FAILED
+}
+
+model GeneratedImage {
+  id            String           @id @default(uuid())
+  userId        String
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  prompt        String
+  stylePreset   String?
+  aspectRatio   String           @default("1:1")
+  storagePath   String?
+  status        GenerationStatus @default(QUEUED)
+  failureReason String?
+  providerJobId String?
+
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@index([userId])
+  @@map("generated_images")
+}
+
+model GeneratedVideo {
+  id            String           @id @default(uuid())
+  userId        String
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  prompt        String
+  sourceImagePath String?        // set for image-to-video, null for text-to-video
+  durationSeconds Int            @default(5)
+  aspectRatio   String           @default("9:16")
+  storagePath   String?
+  status        GenerationStatus @default(QUEUED)
+  failureReason String?
+  providerJobId String?
+
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@index([userId])
+  @@map("generated_videos")
+}
+
+model ErrorLog {
+  id         String   @id @default(uuid())
+  message    String
+  path       String?
+  statusCode Int?
+  createdAt  DateTime @default(now())
+
+  @@map("error_logs")
+}
+
+model FeatureFlag {
+  key         String   @id
+  enabled     Boolean  @default(false)
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  @@map("feature_flags")
+}
+
+model Project {
+  id          String   @id @default(uuid())
+  name        String
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  videos      Video[]
+
+  @@index([ownerId])
+  @@map("projects")
+}
